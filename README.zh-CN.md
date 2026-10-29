@@ -46,17 +46,9 @@ curl -fsSL https://gtron.network/install-node.sh | sh -s -- --dir ~/bin       # 
 
 大约需要 15 分钟，以及一台持续开机的机器：Linux（任意发行版，x86_64 或 arm64）或 macOS。一台小型 VPS 就足够；只需出站 HTTPS，不需要开放端口或域名。
 
-### 1. 已质押 TRX 的 TRON 钱包
+### 1. 已质押 TRX 获取能量的钱包
 
-gtron-node 出租的是您质押的 TRX 产生的**能量**；TRX 本身不会离开钱包。
-
-1. **安装 TronLink**：只从 [tronlink.org](https://www.tronlink.org) 下载浏览器扩展（Chrome、Edge、Brave）或 iOS / Android 应用。假钱包很常见。
-2. **创建钱包**，把助记词抄在纸上。谁拥有助记词谁就拥有钱包；gtron.network 的任何人都不会向您索要它。
-3. **充入 TRX。** 复制钱包地址（以 `T` 开头），从交易所提币到该地址，网络选择 **TRON (TRC-20)**。
-4. **质押获取能量。** 打开 [tronscan.org](https://tronscan.org)，点击右上角 **Connect Wallet** 并选择 TronLink。在账户中打开 **Stake 2.0 / Resources → Get Energy**，保持 **Energy + TRON Power**，输入数量并在 TronLink 中确认。请保留约 150 TRX 未质押，用于网络手续费（仅限委托的密钥一次性约需 100 TRX，见第 5 步）。
-
-> [!TIP]
-> 请为此使用单独的钱包，不要用存放主要资产的钱包。解除质押的 TRX 需要 14 天后才能使用。
+即 TronLink 中已将 TRX 质押为 Energy 的钱包。代理出租它的能量；TRX 本身不会转移。
 
 ### 2. “自有软件”模式的店铺
 
@@ -70,13 +62,25 @@ gtron-node 出租的是您质押的 TRX 产生的**能量**；TRX 本身不会�
 
 **店铺 → 设置 → 钱包 → 添加钱包**：粘贴钱包地址，并在 TronLink 中签署消息。签名只证明钱包属于您，不会转移任何资产。钱包状态会变为 **已验证**。
 
-### 5. 选择代理签名用的密钥
+### 5. 从 TronLink 获取钱包私钥
 
-| | 仅限委托的密钥（推荐） | 钱包自身的私钥 |
-|---|---|---|
-| 如果机器被入侵 | 该密钥只能委托能量，**无法转走 TRX** | 攻击者将控制整个钱包 |
-| 您需要做的 | 向导自动生成密钥；在 tronscan 上为它授权（[步骤](#保护钱包仅限委托的密钥)） | 从 TronLink 导出私钥（[步骤](#导出钱包自身的私钥)） |
-| 费用 | TRON 网络修改权限的手续费（约 100 TRX，一次性） | 无 |
+向导会在 **Private key** 处要求输入：代理用它签署从您钱包发出的委托。
+
+**浏览器中的 TronLink（Chrome / Edge / Brave 扩展）：**
+1. 打开 TronLink，选择有质押的钱包。
+2. 点击右上角 **⋮** → **Export Account**。
+3. 选择 **Private Key**，输入 TronLink 密码。
+4. 复制私钥：64 个字符，由数字和字母 `a–f` 组成。
+
+**手机上的 TronLink（iOS / Android）：**
+1. **我的（Me）** → **钱包管理（Wallet Management）**。
+2. 选择有质押的钱包 → **导出私钥（Export Private Key）**。
+3. 输入密码并复制私钥。
+
+只把私钥粘贴到向导中：输入不会显示，私钥保存在只有代理能读取的文件中。不要发给任何人，也不要存在备忘录里。
+
+> [!TIP]
+> **更安全：单独的仅限委托密钥。** 代理可以使用一个只能委托能量、即使服务器被入侵也无法转走 TRX 的新密钥，代替钱包私钥。向导会自动生成它，您只需在 tronscan 上授权一次：[方法](#保护钱包仅限委托的密钥)。
 
 ### 6. 安装并回答向导
 
@@ -88,9 +92,8 @@ curl -fsSL https://gtron.network/install-node.sh | sh
 |---|---|---|
 | Platform API | 直接回车 | |
 | Shop API key | `pk_live_…` | 第 3 步 |
-| Signing key | *A delegation-only key* 或 *The wallet's own key* | 第 5 步 |
-| Wallet address | 第 1 步的钱包 | 仅用于仅限委托的密钥 |
-| The key itself | *Create a new key here*，或粘贴十六进制私钥 | 第 5 步 |
+| Signing key | *The wallet's own key*（或 *A delegation-only key*，[见上文](#保护钱包仅限委托的密钥)） | |
+| Private key | 钱包私钥 | 第 5 步 |
 | TRON node | *TronGrid* 及其免费 API 密钥 | [trongrid.io](https://www.trongrid.io) → 注册 → Create API key |
 | Who may receive delegations? | *Any client* | 平台会为每笔租赁指定买家 |
 | Safety limits | *Recommended* 或自定义 | [含义](#安全限额) |
@@ -114,10 +117,6 @@ TRON 允许钱包授予第二个密钥有限的**权限**（permission）。给�
 6. 回到向导，回答剩余问题。它会自动在链上找到该权限，配置正确之前不会安装任何内容。
 
 代理每次启动都会再次检查。`gtron-node --check` 会显示正在使用哪种密钥。随时可以在同一个 tronscan 页面删除该权限来撤销密钥。
-
-### 导出钱包自身的私钥
-
-仅在选择 *The wallet's own key* 时需要。在 TronLink 扩展中：**⋮** 菜单 → **Export Account** → **Private Key**，输入 TronLink 密码并复制 64 位私钥。移动应用中在钱包管理 → 导出私钥。只把它粘贴到向导中（输入不会显示），绝不要发到聊天、网站或自己的文件里。
 
 ## 安全建议
 

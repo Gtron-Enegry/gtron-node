@@ -46,17 +46,9 @@ curl -fsSL https://gtron.network/install-node.sh | sh -s -- --dir ~/bin       # 
 
 You need about 15 minutes and a machine that stays on: Linux (any distribution, x86_64 or arm64) or macOS. A small VPS is plenty; it needs outbound HTTPS only, no open ports or domain.
 
-### 1. A TRON wallet with staked TRX
+### 1. A wallet with TRX staked for energy
 
-gtron-node rents out the **energy** your staked TRX produces; the TRX itself never leaves the wallet.
-
-1. **Install TronLink** from [tronlink.org](https://www.tronlink.org): the browser extension (Chrome, Edge, Brave) or the iOS / Android app. Only from there: fake wallets are common.
-2. **Create a wallet** and write the recovery phrase down on paper. Whoever has the phrase has the wallet; no one from gtron.network will ever ask for it.
-3. **Put TRX on it.** Copy the address (starts with `T`) and send TRX to it from an exchange, choosing the **TRON (TRC-20)** network.
-4. **Stake for energy.** Open [tronscan.org](https://tronscan.org), press **Connect Wallet** (top right) and pick TronLink. In your account open **Stake 2.0 / Resources → Get Energy**, keep **Energy + TRON Power**, enter the amount and confirm in TronLink. Leave about 150 TRX unstaked for network fees (a delegation-only key costs about 100 TRX once, see step 5).
-
-> [!TIP]
-> Use a separate wallet for this, not the one with your savings. Unstaked TRX becomes available 14 days after you unstake it.
+The TronLink wallet where your TRX is staked for Energy. The agent rents out its energy; the TRX itself never moves.
 
 ### 2. A shop in “Your software” mode
 
@@ -70,13 +62,25 @@ In the same dialog press **Create key** (or **Shop → Settings → Provider key
 
 **Shop → Settings → Wallets → Add wallet**: paste the wallet's address and sign the message in TronLink. The signature only proves the wallet is yours, it moves nothing. The wallet shows **Verified**.
 
-### 5. Pick the key the agent signs with
+### 5. Get the wallet's private key from TronLink
 
-| | A delegation-only key (recommended) | The wallet's own key |
-|---|---|---|
-| If the machine is hacked | the key can delegate energy, **cannot move TRX** | the attacker controls the whole wallet |
-| What you do | the wizard creates the key; you allow it on tronscan ([steps](#protect-the-wallet-a-delegation-only-key)) | export the private key from TronLink ([steps](#exporting-the-wallets-own-key)) |
-| Cost | TRON's fee for changing permissions (about 100 TRX, once) | none |
+The wizard asks for it as **Private key**: the agent signs the delegations from your wallet with it.
+
+**TronLink in the browser (Chrome / Edge / Brave extension):**
+1. Open TronLink and select the wallet with the stake.
+2. Press **⋮** at the top right → **Export Account**.
+3. Choose **Private Key** and enter your TronLink password.
+4. Copy the key: 64 characters, digits and letters `a–f`.
+
+**TronLink on the phone (iOS / Android):**
+1. **Me** tab → **Wallet Management**.
+2. Select the wallet with the stake → **Export Private Key**.
+3. Enter the password and copy the key.
+
+Paste it only into the wizard: the input is hidden and the key goes into a file only the agent can read. Never send it to anyone or keep it in notes.
+
+> [!TIP]
+> **Safer: a separate delegation-only key.** Instead of the wallet's key, the agent can use a new key that can only delegate energy and cannot move TRX even if the server is hacked. The wizard creates it; you allow it once on tronscan: [how](#protect-the-wallet-a-delegation-only-key).
 
 ### 6. Install and answer the wizard
 
@@ -88,9 +92,8 @@ curl -fsSL https://gtron.network/install-node.sh | sh
 |---|---|---|
 | Platform API | press Enter | |
 | Shop API key | `pk_live_…` | step 3 |
-| Signing key | *A delegation-only key* or *The wallet's own key* | step 5 |
-| Wallet address | the wallet from step 1 | only for a delegation-only key |
-| The key itself | *Create a new key here*, or paste the hex key | step 5 |
+| Signing key | *The wallet's own key* (or *A delegation-only key*, [see above](#protect-the-wallet-a-delegation-only-key)) | |
+| Private key | the wallet's private key | step 5 |
 | TRON node | *TronGrid*, plus its free API key | [trongrid.io](https://www.trongrid.io) → sign up → Create API key |
 | Who may receive delegations? | *Any client* | the platform names the buyer for each rental |
 | Safety limits | *Recommended*, or your own | [what they mean](#safety-limits) |
@@ -114,10 +117,6 @@ TRON lets a wallet give a second key a narrow **permission**. Give the agent a k
 6. Back in the wizard, answer the remaining questions. It finds the permission on chain by itself and installs nothing until it is right.
 
 The agent checks again on every start. `gtron-node --check` shows which kind of key is in use. To revoke the key at any time, delete that permission on the same tronscan page.
-
-### Exporting the wallet's own key
-
-Only if you chose *The wallet's own key*. In the TronLink extension: the **⋮** menu → **Export Account** → **Private Key**, enter the TronLink password and copy the 64-character key. In the mobile app the same is under wallet management → export private key. Paste it only into the wizard (input is hidden), never into a chat, a site or a file of your own.
 
 ## Good practice
 
