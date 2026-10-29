@@ -1,0 +1,16 @@
+# syntax=docker/dockerfile:1
+# Release image: the static musl binaries the release workflow built, nothing else. No RUN
+# steps, so one buildx call makes both architectures without emulation. The context holds
+# bin/amd64/gtron-node and bin/arm64/gtron-node.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+ARG TARGETARCH
+COPY --chmod=0755 bin/${TARGETARCH}/gtron-node /usr/local/bin/gtron-node
+# Same user as the source-built image (Dockerfile): `gtron-node setup` hands the key and the
+# state directory to uid 10001 when it runs as root.
+USER 10001:10001
+WORKDIR /var/lib/gtron-node
+ENV NODE_STATE_DIR=/var/lib/gtron-node \
+    NODE_PRIVATE_KEY_FILE=/run/secrets/wallet_key
+# `docker stop` sends SIGTERM: the job in hand finishes first (allow it 120 s).
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/local/bin/gtron-node"]

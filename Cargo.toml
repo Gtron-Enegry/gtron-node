@@ -1,0 +1,21 @@
+# gtron-node and the two crates it is built from. Exported from the gtron.network monorepo;
+# changes land there first (see CONTRIBUTING in README.md).
+[workspace]
+resolver = "2"
+members = [
+    "crates/tron-address",
+    "crates/tron-signing",
+    "crates/node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.89"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

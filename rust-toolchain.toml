@@ -1,0 +1,6 @@
+# Local and CI builds follow current stable (MSRV is rust-version in Cargo.toml, 1.89). The
+# release image pins its compiler separately: the Dockerfile sets RUSTUP_TOOLCHAIN to the
+# version of its digest-pinned rust image, which takes precedence over this file.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,67 @@
+# systemd unit for gtron-node. `gtron-node setup` installs it; by hand:
+#
+#   sudo install -m 0755 gtron-node /usr/local/bin/gtron-node
+#   sudo useradd --system --home-dir /var/lib/gtron-node --no-create-home --shell /usr/sbin/nologin gtron-node
+#   sudo install -d -o root -g gtron-node -m 0750 /etc/gtron-node
+#   sudo install -o gtron-node -g gtron-node -m 0400 wallet.key /etc/gtron-node/wallet.key
+#   sudo install -o root -g root -m 0600 node.env /etc/gtron-node/node.env
+#   sudo install -m 0644 gtron-node.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now gtron-node
+
+[Unit]
+Description=gtron.network marketplace agent
+Documentation=https://github.com/Gtron-Enegry/gtron-node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=gtron-node
+Group=gtron-node
+# Read by systemd as root, so the agent's own user never needs access to it.
+EnvironmentFile=/etc/gtron-node/node.env
+Environment=NODE_PRIVATE_KEY_FILE=/etc/gtron-node/wallet.key
+Environment=NODE_STATE_DIR=/var/lib/gtron-node
+# Creates /var/lib/gtron-node owned by the service user, mode 0700. It holds the signed
+# transactions: keep it across upgrades and never share it between two agents.
+StateDirectory=gtron-node
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/gtron-node
+# Prints the readiness report into the journal; "-" so an outage of the platform does not
+# keep the agent from starting (it waits that out on its own).
+ExecStartPre=-/usr/local/bin/gtron-node --check
+ExecStart=/usr/local/bin/gtron-node
+Restart=on-failure
+RestartSec=10s
+# SIGTERM lets the job in hand finish (a TRON call times out after 15 s, a platform call
+# after 40 s); past this systemd kills it, which is safe but makes the job resume later.
+TimeoutStopSec=120s
+
+# Hardening: the agent needs outbound HTTPS, its state directory and nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

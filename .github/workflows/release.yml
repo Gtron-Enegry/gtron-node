@@ -1,0 +1,128 @@
+name: release
+
+# Push a tag `v<version>` (the workspace version) to release: binaries for Linux (static
+# musl, x86_64 and arm64) and macOS, SHA256SUMS, install.sh, and the image
+# ghcr.io/gtron-enegry/gtron-node. The release is built as a draft and published only once
+# every file is up, so `releases/latest` never points at a half-uploaded one.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  GH_TOKEN: ${{ github.token }}
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Tag matches the workspace version
+        run: |
+          v="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)"/\1/')"
+          test "$TAG" = "v$v" || { echo "tag $TAG, workspace version $v"; exit 1; }
+      - name: Create draft
+        run: |
+          gh release create "$TAG" --draft --verify-tag --title "gtron-node ${TAG#v}" \
+            --notes "Install or upgrade: \`curl -fsSL https://gtron.network/install-node.sh | sh\`. Docker: \`ghcr.io/gtron-enegry/gtron-node:${TAG#v}\`. Check archives against SHA256SUMS."
+
+  build:
+    needs: draft
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, zig: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, zig: false }
+          - { target: x86_64-apple-darwin, os: macos-latest, zig: false }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-zigbuild
+      - name: Install zig
+        if: matrix.zig
+        # cargo-zigbuild finds zig through `python3 -m ziglang`; a venv keeps it off the
+        # runner's externally-managed system Python.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.13.0
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+      - name: Test
+        # Once per OS, on the host: the cross builds compile the same code.
+        if: matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'aarch64-apple-darwin'
+        run: cargo test --workspace --locked
+      - name: Build
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cargo zigbuild --release --locked -p gtron-node --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p gtron-node --target ${{ matrix.target }}
+          fi
+      - name: Package
+        # Unversioned names, so releases/latest/download/<name> always works for install.sh.
+        run: |
+          name="gtron-node-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/gtron-node" README.md LICENSE "$name/"
+          cp crates/node/dist/gtron-node.service crates/node/dist/node.env.example "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - run: gh release upload "$TAG" gtron-node-*.tar.gz --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Checksums and installer
+        run: |
+          mkdir out && cd out
+          gh release download "$TAG" --pattern 'gtron-node-*.tar.gz'
+          cp ../install.sh .
+          sha256sum gtron-node-*.tar.gz install.sh | tee SHA256SUMS
+          gh release upload "$TAG" SHA256SUMS install.sh --clobber
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Image
+        run: |
+          mkdir -p image/bin/amd64 image/bin/arm64
+          tar -xzf out/gtron-node-x86_64-unknown-linux-musl.tar.gz -C "$RUNNER_TEMP"
+          tar -xzf out/gtron-node-aarch64-unknown-linux-musl.tar.gz -C "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/gtron-node-x86_64-unknown-linux-musl/gtron-node" image/bin/amd64/
+          cp "$RUNNER_TEMP/gtron-node-aarch64-unknown-linux-musl/gtron-node" image/bin/arm64/
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          image="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          docker buildx build image -f crates/node/dist/Dockerfile.release \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            --label "org.opencontainers.image.version=${TAG#v}" \
+            -t "$image:${TAG#v}" -t "$image:latest" --push
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false --latest

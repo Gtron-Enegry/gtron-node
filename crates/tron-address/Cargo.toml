@@ -1,0 +1,21 @@
+[package]
+name = "gtron-tron-address"
+description = "Validated TRON base58check addresses"
+version.workspace = true
+edition.workspace = true
+# Public with gtron-node (github.com/Gtron-Enegry/gtron-node); the platform crates are not.
+license = "Apache-2.0"
+repository = "https://github.com/Gtron-Enegry/gtron-node"
+publish.workspace = true
+rust-version.workspace = true
+
+[features]
+# `utoipa::ToSchema` for the platform's OpenAPI document.
+openapi = ["dep:utoipa"]
+
+[dependencies]
+bs58 = "0.5.1"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+utoipa = { version = "5.5.0", optional = true }

@@ -1,0 +1,26 @@
+# cargo-deny: `cargo deny check advisories bans sources` (CI job `advisories`).
+# Licenses are not checked here.
+
+[graph]
+all-features = false
+
+[advisories]
+# RustSec database. Vulnerabilities and yanked crates fail the build.
+yanked = "deny"
+# Unmaintained crates fail only when we depend on them directly; transitive ones (e.g. `paste`
+# through utoipa-axum) are reported as warnings by `cargo audit` and tracked upstream.
+unmaintained = "workspace"
+ignore = [
+    # Add entries as { id = "RUSTSEC-YYYY-NNNN", reason = "..." } with a reason and an owner.
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Path dependencies inside the workspace have no version requirement to check.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
