@@ -7,7 +7,7 @@
 //! Env: NODE_API_URL (https://api.example.com), NODE_API_KEY (pk_live_…),
 //! NODE_PRIVATE_KEY (hex) or NODE_PRIVATE_KEY_FILE (path, mode 0400; preferred),
 //! TRONGRID_URL (https; TRONGRID_ALLOW_HTTP=1 for a private plain-http node),
-//! TRONGRID_API_KEY, NODE_STATE_DIR (.gtron-node), NODE_LOCK_DELEGATIONS (true),
+//! TRONGRID_API_KEY, NODE_STATE_DIR (~/.gtron-node/state), NODE_LOCK_DELEGATIONS (true),
 //! NODE_MAX_BALANCE_SUN, NODE_MAX_DAILY_BALANCE_SUN, NODE_MAX_LOCKED_BALANCE_SUN,
 //! NODE_MAX_LOCK_SECONDS, NODE_ALLOWED_RECEIVERS or NODE_ALLOW_ANY_RECEIVER=1.
 //! A `.env` in the working directory is read only if it is owned by this user and not
@@ -32,6 +32,7 @@ mod check;
 mod config;
 mod job;
 mod limits;
+mod printable;
 mod setup;
 
 use std::path::Path;
@@ -50,8 +51,8 @@ use k256::ecdsa::SigningKey;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-use crate::agent::{Agent, EXPIRY_MARGIN_MS, JOB_RETRY};
-use crate::backoff::RetryQueue;
+use crate::agent::{Agent, KeyScope, EXPIRY_MARGIN_MS, JOB_RETRY};
+use crate::backoff::{Backoff, RetryQueue};
 use crate::config::Cli;
 use crate::limits::LocalLimits;
 
@@ -78,9 +79,16 @@ fn main() -> anyhow::Result<ExitCode> {
     let raw = Zeroizing::new(hex::decode(hex_key.trim().trim_start_matches("0x"))?);
     drop(hex_key);
     let key = SigningKey::from_slice(&raw)?;
-    let address = address_of(&key);
+    let signer = address_of(&key);
+    let (address, permission_id) = cli.wallet(&signer)?;
     if cli.address {
         println!("{address}");
+        if address != signer {
+            eprintln!(
+                "signing key {signer}, permission {}",
+                permission_id.unwrap_or(0)
+            );
+        }
         return Ok(ExitCode::SUCCESS);
     }
     // The pk_ key and the job stream must not travel in clear text.
@@ -89,7 +97,11 @@ fn main() -> anyhow::Result<ExitCode> {
     check_node_url_with(&cli.trongrid_url, allow_plain_http_from_env())?;
     let limits = cli.limits()?;
     // `--check` next to a running agent: its directory lock is expected, not an error.
-    let (store, state_note) = match Store::open(&cli.state_dir) {
+    let state_dir = cli.state_dir()?;
+    if cli.state_dir.as_ref().is_some_and(|d| d.is_relative()) {
+        tracing::warn!(dir = %state_dir.display(), "NODE_STATE_DIR is relative; start the agent from the same directory every time, or make it absolute");
+    }
+    let (store, state_note) = match Store::open(&state_dir) {
         Ok(s) => (s, None),
         Err(StoreError::Locked(d)) if cli.check => (
             Store::memory(),
@@ -100,13 +112,22 @@ fn main() -> anyhow::Result<ExitCode> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run(cli, key, address, limits, store, state_note))
+        .block_on(run(
+            cli,
+            key,
+            address,
+            permission_id,
+            limits,
+            store,
+            state_note,
+        ))
 }
 
 async fn run(
     cli: Cli,
     key: SigningKey,
     address: TronAddress,
+    permission_id: Option<i32>,
     limits: LocalLimits,
     store: Store,
     state_note: Option<String>,
@@ -116,11 +137,13 @@ async fn run(
             .timeout(Duration::from_secs(40))
             // Lets the platform see which agent versions are still out there.
             .user_agent(concat!("gtron-node/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
         api_url: cli.api_url.trim_end_matches('/').to_owned(),
         api_key: cli.api_key,
         key,
         address,
+        permission_id,
         node: Node::new(
             &cli.trongrid_url,
             cli.trongrid_api_key,
@@ -139,6 +162,32 @@ async fn run(
         } else {
             ExitCode::FAILURE
         });
+    }
+    // A permission that allows more than delegating would make a stolen key worth more
+    // than the caps say: refuse to run with it. Wait out a node that does not answer.
+    let mut wait = Backoff::new(JOB_RETRY.0, JOB_RETRY.1);
+    loop {
+        match agent.key_scope().await {
+            Ok(KeyScope::Owner) => {
+                tracing::warn!(
+                    "signing with the wallet's own key: if this machine is compromised the key can move all its TRX; a delegation-only permission key avoids that (see the README)"
+                );
+                break;
+            }
+            Ok(KeyScope::DelegationOnly(id)) => {
+                tracing::info!(
+                    permission = id,
+                    "signing key may only delegate and reclaim resources"
+                );
+                break;
+            }
+            Err(Ok(refused)) => anyhow::bail!(refused),
+            Err(Err(e)) => {
+                let d = wait.next_delay();
+                tracing::warn!(error = %e, retry_in = ?d, "cannot read the wallet's permissions from the TRON node");
+                tokio::time::sleep(d).await;
+            }
+        }
     }
     let (stop_tx, stop_rx) = watch::channel(false);
     tokio::spawn(async move {

@@ -5,9 +5,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use gtron_tron_address::TronAddress;
-use gtron_tron_signing::keys::sign_raw_data;
+use gtron_tron_signing::keys::{address_of, sign_raw_data};
 use gtron_tron_signing::store::{Record, Store};
-use gtron_tron_signing::tron::Node;
+use gtron_tron_signing::tron::{read_body, Node, MAX_BODY};
 use gtron_tron_signing::txcheck::{self, Bounds, Expected};
 use k256::ecdsa::SigningKey;
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use tokio::time::Instant;
 
 use crate::backoff::{Backoff, RetryQueue};
 use crate::job::{Job, JobKind, JobList, JobStatus};
-use crate::limits::{CapEvent, LocalLimits, DAY_MS};
+use crate::limits::{self, CapEvent, LocalLimits};
 
 /// After expiration, how long a broadcast transaction may still show up before "the node
 /// does not know it" is taken to mean it never landed.
@@ -59,12 +59,24 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// What a stolen signing key could do with the wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyScope {
+    /// The wallet's own key: everything, including moving all its TRX.
+    Owner,
+    /// A key of this active permission, which only delegates and reclaims resources.
+    DelegationOnly(i32),
+}
+
 pub struct Agent {
     pub http: reqwest::Client,
     pub api_url: String,
     pub api_key: String,
     pub key: SigningKey,
+    /// The wallet whose stake is delegated.
     pub address: TronAddress,
+    /// The wallet's active permission `key` signs under; None = `key` is the wallet's own.
+    pub permission_id: Option<i32>,
     pub node: Node,
     pub lock: bool,
     pub limits: LocalLimits,
@@ -89,7 +101,9 @@ impl Agent {
         }
         let res = req.send().await?;
         let status = res.status();
-        let text = res.text().await?;
+        let text = read_body(res, MAX_BODY)
+            .await
+            .map_err(|e| anyhow::anyhow!("{path}: {e}"))?;
         if !status.is_success() {
             anyhow::bail!(
                 "{path}: HTTP {status}: {}",
@@ -97,6 +111,26 @@ impl Agent {
             );
         }
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// What the signing key can do, as the chain says. `Err(Ok(..))`: the permission is
+    /// not usable or allows more than delegating, `Err(Err(..))`: the node did not answer.
+    pub async fn key_scope(&self) -> Result<KeyScope, Result<String, String>> {
+        let Some(id) = self.permission_id else {
+            return Ok(KeyScope::Owner);
+        };
+        let signer = address_of(&self.key);
+        match self.node.active_permission(&self.address, id).await {
+            Ok(Some(p)) => p
+                .check_delegation_only(&signer)
+                .map(|()| KeyScope::DelegationOnly(id))
+                .map_err(|e| Ok(format!("permission {id} of {}: {e}", self.address))),
+            Ok(None) => Err(Ok(format!(
+                "{} has no active permission {id}",
+                self.address
+            ))),
+            Err(e) => Err(Err(e.to_string())),
+        }
     }
 
     pub fn events(&self) -> anyhow::Result<Vec<CapEvent>> {
@@ -109,8 +143,7 @@ impl Agent {
         self.limits
             .check_caps(&events, &ev, now)
             .map_err(|r| anyhow::anyhow!(r))?;
-        events.retain(|e| e.at_ms > now - DAY_MS || e.locked_until_ms > now);
-        events.push(ev);
+        limits::record(&mut events, ev, now);
         self.store.put_blob(CAPS_BLOB, &events)?;
         Ok(())
     }
@@ -187,6 +220,7 @@ impl Agent {
             at_ms: now,
             balance_sun,
             locked_until_ms: lock_blocks.map_or(now, |b| now.saturating_add(b * 3000)),
+            receiver: Some(receiver.to_string()),
         });
         if let Some(ev) = &event {
             let events = self.events().map_err(decline)?;
@@ -206,7 +240,13 @@ impl Agent {
         let (tx, expected) = match job.kind {
             JobKind::Delegate => (
                 self.node
-                    .delegate_resource(&self.address, &receiver, balance_sun, lock_blocks, None)
+                    .delegate_resource(
+                        &self.address,
+                        &receiver,
+                        balance_sun,
+                        lock_blocks,
+                        self.permission_id,
+                    )
                     .await
                     .map_err(decline)?,
                 Expected::Delegate {
@@ -218,7 +258,7 @@ impl Agent {
             ),
             JobKind::Undelegate => (
                 self.node
-                    .undelegate_resource(&self.address, &receiver, balance_sun, None)
+                    .undelegate_resource(&self.address, &receiver, balance_sun, self.permission_id)
                     .await
                     .map_err(decline)?,
                 Expected::Undelegate {
@@ -237,6 +277,7 @@ impl Agent {
             &expected,
             &Bounds {
                 max_fee_limit_sun: 0,
+                permission_id: self.permission_id.unwrap_or(0),
                 ..Bounds::default()
             },
             now_ms(),
@@ -494,6 +535,7 @@ mod tests {
         receiver: &TronAddress,
         balance: i64,
         lock_period: Option<i64>,
+        permission_id: Option<i64>,
         expiration: i64,
     ) -> Vec<u8> {
         let mut value = Vec::new();
@@ -515,6 +557,9 @@ mod tests {
         let mut c = Vec::new();
         int_field(1, 57, &mut c);
         bytes_field(2, &any, &mut c);
+        if let Some(p) = permission_id {
+            int_field(5, p, &mut c);
+        }
         let mut raw = Vec::new();
         bytes_field(1, &[0x07, 0x90], &mut raw);
         bytes_field(
@@ -561,6 +606,7 @@ mod tests {
             &receiver,
             b["balance"].as_i64().unwrap(),
             b["lock_period"].as_i64(),
+            b["Permission_id"].as_i64(),
             now_ms() + m.expiration_ms.load(Ordering::SeqCst),
         );
         Json(serde_json::json!({
@@ -682,6 +728,7 @@ mod tests {
             api_key: "pk_test".into(),
             address: address_of(&key),
             key,
+            permission_id: None,
             node: Node::new(&url, None, Duration::from_secs(5)),
             lock: true,
             limits: limits(),
@@ -702,6 +749,26 @@ mod tests {
             "duration_seconds": 3600,
             "status": status,
         })
+    }
+
+    #[tokio::test]
+    async fn a_permission_key_signs_for_the_wallet_under_its_permission() {
+        let (m, a) = agent(EXPIRY_MARGIN_MS).await;
+        let mut a = Arc::into_inner(a).unwrap();
+        let wallet: TronAddress = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".parse().unwrap();
+        a.address = wallet.clone();
+        a.permission_id = Some(2);
+        let mut j = job_json("jp", "delegate", "pending");
+        j["from_address"] = serde_json::json!(wallet.as_str());
+        a.process(&serde_json::from_value(j).unwrap()).await;
+        assert_eq!(m.accepted.lock().unwrap().len(), 1);
+        assert!(m.declined.lock().unwrap().is_empty());
+        // The same job for the key's own address is not this agent's.
+        let mut j = job_json("jq", "delegate", "pending");
+        j["from_address"] = serde_json::json!(address_of(&a.key).as_str());
+        a.process(&serde_json::from_value(j).unwrap()).await;
+        assert_eq!(m.accepted.lock().unwrap().len(), 1);
+        assert_eq!(*m.declined.lock().unwrap(), vec!["jq".to_owned()]);
     }
 
     fn job(id: &str, status: &str) -> Job {

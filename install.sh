@@ -60,6 +60,15 @@ main() {
     fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS"
     verify "$tmp" "$asset"
     ok "Checksum matches SHA256SUMS"
+    # SHA256SUMS comes from the same place as the archive; the attestation proves the
+    # archive was built by this repository's release workflow.
+    if have gh && gh auth status >/dev/null 2>&1; then
+        gh attestation verify "$tmp/$asset" -R "$REPO" >/dev/null 2>&1 ||
+            fail "$asset has no valid build attestation from $REPO: not installing it"
+        ok "Built by github.com/$REPO (attestation verified)"
+    else
+        note "With the GitHub CLI signed in, the installer also checks the build attestation"
+    fi
 
     tar -xzf "$tmp/$asset" -C "$tmp"
     bin="$tmp/gtron-node-$target/gtron-node"

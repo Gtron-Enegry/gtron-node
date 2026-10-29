@@ -42,31 +42,81 @@ curl -fsSL https://gtron.network/install-node.sh | sh -s -- --dir ~/bin       # 
 
 </details>
 
-## What you need
+## Connect your wallet, step by step
 
-| | |
-|---|---|
-| **A shop on gtron.network** in *agent* mode, and a provider API key (`pk_live_…`) with the `jobs` scope. Cabinet → Shop → API keys. | 🏪 |
-| **A TRON wallet** with staked TRX: its private key in hex, as TronLink exports it. | 👛 |
-| **A machine that stays on:** Linux (any distribution, x86_64 or arm64) or macOS (Apple Silicon or Intel). A small VPS is plenty. | 🖥️ |
-| **Outbound HTTPS only.** No open ports, no public IP, no domain. | 🔒 |
+You need about 15 minutes and a machine that stays on: Linux (any distribution, x86_64 or arm64) or macOS. A small VPS is plenty; it needs outbound HTTPS only, no open ports or domain.
 
-## The setup wizard
+### 1. A TRON wallet with staked TRX
 
-`gtron-node setup` asks a few questions and does the rest. You can run it again at any time to change the answers.
+gtron-node rents out the **energy** your staked TRX produces; the TRX itself never leaves the wallet. In TronLink, stake TRX for **Energy** (Stake 2.0).
 
-| Step | What it asks | Good to know |
-|:---:|---|---|
-| 1 | **Platform API** | Press Enter for `https://api.gtron.network`. |
-| 2 | **Shop API key** | Checked with the platform right away. Typed hidden. |
-| 3 | **Wallet private key** | Typed hidden, stored in a file only the agent can read. The wizard shows the wallet address for you to confirm. |
-| 4 | **Wallet link** | Adds the wallet to your shop and proves you own it by signing the platform's verification message. |
-| 5 | **TRON node** | TronGrid (recommended; a free API key raises the rate limit) or your own full node. |
-| 6 | **Receivers** | Anyone who rents from your shop, or only an allowlist of addresses. |
-| 7 | **Safety limits** | Recommended values or your own. See [limits](#safety-limits). |
-| 8 | **How to run** | A system service (systemd), Docker, a macOS background service (launchd) or by hand. Only the options your machine supports are listed. |
+> [!TIP]
+> Use a separate wallet for this, not the one with your savings.
 
-At the end the wizard prints where the settings, the state and the logs are, and the commands to manage the service.
+### 2. A shop in “Your software” mode
+
+Sign in at [gtron.network](https://gtron.network), open **Shop → Change mode** and choose **Your software**.
+
+### 3. The shop's provider key
+
+In the same dialog press **Create key** (or **Shop → Settings → Provider keys**, purpose **Agent**). It looks like `pk_live_…` and is shown **once**: copy it somewhere safe for the next few minutes.
+
+### 4. Add the wallet to the shop
+
+**Shop → Settings → Wallets → Add wallet**: paste the wallet's address and sign the message in TronLink. The signature only proves the wallet is yours, it moves nothing. The wallet shows **Verified**.
+
+### 5. Pick the key the agent signs with
+
+| | A delegation-only key (recommended) | The wallet's own key |
+|---|---|---|
+| If the machine is hacked | the key can delegate energy, **cannot move TRX** | the attacker controls the whole wallet |
+| What you do | the wizard creates the key; you give it a permission in TronLink or on tronscan ([how](#protect-the-wallet-a-delegation-only-key)) | export the private key from TronLink (wallet menu → *Export private key*) |
+| Cost | TRON's fee for changing permissions (about 100 TRX) | none |
+
+### 6. Install and answer the wizard
+
+```sh
+curl -fsSL https://gtron.network/install-node.sh | sh
+```
+
+| The wizard asks | You enter | Where it comes from |
+|---|---|---|
+| Platform API | press Enter | |
+| Shop API key | `pk_live_…` | step 3 |
+| Signing key | *A delegation-only key* or *The wallet's own key* | step 5 |
+| Wallet address · Permission id | the wallet from step 1 · `2` (or the id tronscan shows) | only for a delegation-only key |
+| The key itself | *Create a new key here*, or paste the hex key | step 5 |
+| TRON node | *TronGrid*, plus its free API key | [trongrid.io](https://www.trongrid.io) → sign up → Create API key |
+| Who may receive delegations? | *Any client* | the platform names the buyer for each rental |
+| Safety limits | *Recommended*, or your own | [what they mean](#safety-limits) |
+| How should gtron-node run? | the first option offered | systemd, Docker, launchd or by hand |
+
+Typed secrets stay hidden. The wizard checks each answer as you go: the key with the platform, the wallet's balance and permission with the TRON node. At the end it shows where the settings and logs are. In the cabinet the **Change mode** dialog turns to *connected* within a few seconds.
+
+## Protect the wallet: a delegation-only key
+
+TRON lets a wallet give a second key a narrow **permission**. Give the agent a key that may
+only *delegate* and *reclaim* resources: even if someone takes over this machine, that key
+cannot move a single TRX. Your own key stays in TronLink.
+
+1. In `gtron-node setup` choose **A delegation-only key → Create a new key here**. The wizard
+   shows the new key's address.
+2. In TronLink or on [tronscan.org](https://tronscan.org) (Account → Permissions) add an
+   **active permission** to your wallet: that address with weight 1, threshold 1, and only
+   the operations **Delegate resource** and **Reclaim resource**. TRON charges a fee for
+   updating permissions.
+3. Back in the wizard, it checks the permission on chain and installs nothing until it is right.
+
+The agent checks again on every start and refuses to run if the permission allows anything
+more. `gtron-node --check` shows which kind of key is in use.
+
+## Good practice
+
+- **Use a separate wallet** for renting out energy, not the one that holds your savings.
+- **Start small** and raise the limits once you have seen it work.
+- **Prefer an allowlist** of receivers if you serve known clients.
+- **Delegate from this wallet only through the agent.** Delegations made elsewhere do not
+  count towards its limits.
 
 ## How it works
 
@@ -91,9 +141,9 @@ The agent connects out to the platform and waits for jobs. Each job is a delegat
 
 | | |
 |---|---|
-| 🔑 **The key stays with you** | It is read from a file with owner-only permissions and used only to sign. It is never sent anywhere, and there is deliberately no command-line flag for it. |
+| 🔑 **The key stays with you** | It is read from a file with owner-only permissions and used only to sign. It is never sent anywhere, and there is deliberately no command-line flag for it. With a [delegation-only key](#protect-the-wallet-a-delegation-only-key) it cannot move TRX even if stolen. |
 | 🧾 **It signs exactly the job** | The transaction built by the TRON node is decoded and compared with the job field by field: type, wallet, receiver, resource, amount, lock. Anything else is refused. |
-| 🛡️ **Your limits, not ours** | Per-delegation, per-24-hours and total-locked caps plus the receiver allowlist are checked on your machine. A compromised platform account cannot get past them. |
+| 🛡️ **Your limits, not ours** | Per-delegation, per-24-hours and total-locked caps plus the receiver allowlist are checked on your machine. A compromised platform account cannot get past them. Locks are counted the way TRON keeps them: a new lock to a receiver extends the earlier ones. |
 | 1️⃣ **One signature per job** | The signed transaction is saved to disk before it is broadcast. After a crash or a restart the same transaction is sent again; a second one is never signed. |
 | 🌊 **Calm under failure** | If the platform or the TRON node is down, the agent backs off from 2 seconds up to a minute, so TronGrid will not ban your API key. |
 | ⏹️ **Clean shutdown** | `SIGTERM` or Ctrl+C: the job in hand is finished first. A second Ctrl+C exits at once, which is also safe. |
@@ -164,12 +214,13 @@ Start from [`crates/node/dist/node.env.example`](crates/node/dist/node.env.examp
 | Variable | Meaning |
 |---|---|
 | `NODE_API_URL`, `NODE_API_KEY` | Platform address and the shop's provider key (`jobs` scope) |
-| `NODE_PRIVATE_KEY_FILE` | The wallet key file: hex, owned by the agent's user, mode `0400` |
+| `NODE_PRIVATE_KEY_FILE` | The signing key file: hex, owned by the agent's user, mode `0400` |
+| `NODE_WALLET_ADDRESS`, `NODE_PERMISSION_ID` | For a delegation-only key: the wallet it signs for and the permission id |
 | `TRONGRID_URL`, `TRONGRID_API_KEY` | Your TRON node, or TronGrid with an API key |
 | `NODE_ALLOW_ANY_RECEIVER=1` or `NODE_ALLOWED_RECEIVERS=T…,T…` | Who may receive delegations; one of the two is required |
 | `NODE_MAX_*` | [Safety limits](#safety-limits) |
 | `NODE_LOCK_DELEGATIONS` | Lock delegations for the rental (default `true`); the platform counts only locked ones |
-| `NODE_STATE_DIR` | State directory (default `.gtron-node`) |
+| `NODE_STATE_DIR` | State directory (default `~/.gtron-node/state`) |
 | `RUST_LOG` | `error`, `warn`, `info` or `debug` |
 
 The agent refuses to read a key file or settings file that other users can read.
@@ -230,7 +281,11 @@ Every release lists `SHA256SUMS` for all archives and `install.sh`. The installe
 sha256sum -c SHA256SUMS --ignore-missing      # macOS: shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-Releases are built by [GitHub Actions](.github/workflows/release.yml) from the tagged source in this repository.
+Releases are built by [GitHub Actions](.github/workflows/release.yml) from the tagged source in this repository, and every file and the Docker image carry a build provenance attestation. With the [GitHub CLI](https://cli.github.com) the installer checks it too; by hand:
+
+```sh
+gh attestation verify gtron-node-x86_64-unknown-linux-musl.tar.gz -R Gtron-Enegry/gtron-node
+```
 
 ## Build from source
 

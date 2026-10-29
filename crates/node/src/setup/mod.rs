@@ -49,13 +49,12 @@ mod wizard {
     use zeroize::Zeroizing;
 
     use super::install::{self, Host, Receivers, Settings, Target};
-    use super::platform::{Platform, Shop};
+    use super::platform::{is_verification_message, Platform, Shop};
     use super::tty::discard_typeahead;
+    use crate::printable::printable;
 
     const DEFAULT_API: &str = "https://api.gtron.network";
     const TRONGRID: &str = "https://api.trongrid.io";
-    /// What the platform asks a wallet to sign (gtron_app::marketplace::verification_message).
-    const VERIFY_PREFIX: &str = "gtron.network address verification\n";
     const RECOMMENDED: (u64, u64, u64, u64) = (50_000, 200_000, 500_000, 30);
 
     pub fn cancelled(e: &anyhow::Error) -> bool {
@@ -158,39 +157,81 @@ mod wizard {
         shop_notes(&shop)?;
 
         // ---- 2. Wallet ----------------------------------------------------------------
-        let (hex_key, signing_key, address) = loop {
-            discard_typeahead();
-            let raw = Zeroizing::new(
-                cliclack::password("Wallet private key")
-                    .mask('•')
-                    .validate(|s: &String| {
-                        let h = s.trim().trim_start_matches("0x");
-                        if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
-                            Ok(())
-                        } else {
-                            Err("64 hex characters, as TronLink exports it (Settings → Export private key)")
-                        }
-                    })
-                    .interact()?,
-            );
-            let hex_key = Zeroizing::new(raw.trim().trim_start_matches("0x").to_lowercase());
-            let bytes = Zeroizing::new(hex::decode(hex_key.as_str())?);
-            let Ok(key) = SigningKey::from_slice(&bytes) else {
-                cliclack::log::error("That is not a valid secp256k1 private key.")?;
-                continue;
-            };
-            let address = address_of(&key);
-            if cliclack::confirm(format!(
-                "Is {} the wallet your shop delegates from?",
-                style(address.as_str()).bold()
-            ))
-            .initial_value(true)
-            .interact()?
+        let limited = cliclack::select("Signing key")
+            .item(
+                true,
+                "A delegation-only key",
+                "recommended · if this machine is compromised, the key still cannot move TRX",
+            )
+            .item(
+                false,
+                "The wallet's own key",
+                "simplest · whoever gets this machine controls the wallet",
+            )
+            .interact()?;
+        let (hex_key, signing_key, address, permission_id) = if limited {
+            let wallet: String = cliclack::input("Wallet address (the one holding the staked TRX)")
+                .placeholder("T…")
+                .validate(|s: &String| {
+                    s.trim()
+                        .parse::<TronAddress>()
+                        .map(|_| ())
+                        .map_err(|_| "Not a TRON address")
+                })
+                .interact()?;
+            let wallet: TronAddress = wallet.trim().parse()?;
+            let id: String = cliclack::input("Permission id")
+                .default_input("2")
+                .validate(|s: &String| match s.trim().parse::<i32>() {
+                    Ok(n) if n >= 2 => Ok(()),
+                    _ => Err("Active permissions are numbered from 2"),
+                })
+                .interact()?;
+            let id: i32 = id.trim().parse()?;
+            let (hex_key, key) = if cliclack::select("The key itself")
+                .item(
+                    true,
+                    "Create a new key here",
+                    "recommended · it never exists anywhere else",
+                )
+                .item(false, "Paste a key I already added to the permission", "")
+                .interact()?
             {
-                break (hex_key, key, address);
+                new_key()?
+            } else {
+                ask_key()?
+            };
+            let signer = address_of(&key);
+            cliclack::note(
+                "Give this key the permission",
+                format!(
+                    "Key address  {}\n\nIn TronLink or on tronscan.org (Account → Permissions), give wallet\n{} an active permission with id {id} that:\n  · has this key address with weight 1, threshold 1\n  · allows only “Delegate resource” and “Reclaim resource”\n\nSetup checks it on chain before it installs anything.",
+                    style(signer.as_str()).bold(),
+                    wallet
+                ),
+            )?;
+            (hex_key, key, wallet, Some(id))
+        } else {
+            loop {
+                let (hex_key, key) = ask_key()?;
+                let address = address_of(&key);
+                if cliclack::confirm(format!(
+                    "Is {} the wallet your shop delegates from?",
+                    style(address.as_str()).bold()
+                ))
+                .initial_value(true)
+                .interact()?
+                {
+                    break (hex_key, key, address, None);
+                }
             }
         };
-        link_wallet(rt, &platform, &signing_key, &address)?;
+        link_wallet(
+            rt,
+            &platform,
+            permission_id.is_none().then_some(&signing_key),
+            &address,
+        )?;
 
         // ---- 3. TRON node -------------------------------------------------------------
         let (trongrid_url, trongrid_api_key, allow_plain_http_node) = loop {
@@ -252,6 +293,9 @@ mod wizard {
                         "TRON node reachable · wallet holds {} TRX",
                         trx((sun / 1_000_000).max(0) as u64)
                     ));
+                    if let Some(id) = permission_id {
+                        check_permission(rt, &node, &address, id, &address_of(&signing_key))?;
+                    }
                     break (url, key, plain);
                 }
                 Err(e) => {
@@ -350,7 +394,7 @@ mod wizard {
             );
             first.get_or_insert(Target::Docker);
         }
-        if host.macos {
+        if host.launchd_ok() {
             pick = pick.item(
                 Target::Launchd,
                 "Background service",
@@ -378,13 +422,18 @@ mod wizard {
             max_daily_trx,
             max_locked_trx,
             max_lock_days,
+            permission: permission_id.map(|id| (address.clone(), id)),
         };
         cliclack::note(
             "Summary",
             format!(
-                "Shop      {}\nWallet    {}\nTRON      {}\nReceivers {}\nLimits    {} / {} per 24 h / {} locked TRX, rentals ≤ {} days",
+                "Shop      {}\nWallet    {}\nKey       {}\nTRON      {}\nReceivers {}\nLimits    {} / {} per 24 h / {} locked TRX, rentals ≤ {} days",
                 shop.name,
                 address,
+                match permission_id {
+                    Some(id) => format!("delegation-only, permission {id}"),
+                    None => "the wallet's own key".to_owned(),
+                },
                 settings.trongrid_url,
                 match &settings.receivers {
                     Receivers::Any => "any client".to_owned(),
@@ -469,10 +518,82 @@ mod wizard {
     }
 
     /// Make sure the platform knows this wallet belongs to the shop; offer to prove it.
+    fn ask_key() -> anyhow::Result<(Zeroizing<String>, SigningKey)> {
+        loop {
+            discard_typeahead();
+            let raw = Zeroizing::new(
+                cliclack::password("Private key")
+                    .mask('•')
+                    .validate(|s: &String| {
+                        let h = s.trim().trim_start_matches("0x");
+                        if h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+                            Ok(())
+                        } else {
+                            Err("64 hex characters, as TronLink exports it (Settings → Export private key)")
+                        }
+                    })
+                    .interact()?,
+            );
+            let hex_key = Zeroizing::new(raw.trim().trim_start_matches("0x").to_lowercase());
+            let bytes = Zeroizing::new(hex::decode(hex_key.as_str())?);
+            match SigningKey::from_slice(&bytes) {
+                Ok(key) => return Ok((hex_key, key)),
+                Err(_) => cliclack::log::error("That is not a valid secp256k1 private key.")?,
+            }
+        }
+    }
+
+    /// A fresh key from the OS random source.
+    fn new_key() -> anyhow::Result<(Zeroizing<String>, SigningKey)> {
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")?;
+        loop {
+            let mut bytes = Zeroizing::new([0u8; 32]);
+            f.read_exact(bytes.as_mut())?;
+            if let Ok(key) = SigningKey::from_slice(bytes.as_ref()) {
+                return Ok((Zeroizing::new(hex::encode(bytes.as_ref())), key));
+            }
+        }
+    }
+
+    /// Wait until the wallet's permission `id` lets `signer` delegate and nothing more.
+    fn check_permission(
+        rt: &Runtime,
+        node: &Node,
+        wallet: &TronAddress,
+        id: i32,
+        signer: &TronAddress,
+    ) -> anyhow::Result<()> {
+        loop {
+            let sp = cliclack::spinner();
+            sp.start("Checking the wallet's permission on chain…");
+            let problem = match rt.block_on(node.active_permission(wallet, id)) {
+                Ok(Some(p)) => match p.check_delegation_only(signer) {
+                    Ok(()) => {
+                        sp.stop(format!(
+                            "Permission {id}: this key may only delegate and reclaim resources"
+                        ));
+                        return Ok(());
+                    }
+                    Err(e) => e,
+                },
+                Ok(None) => format!("{wallet} has no active permission {id} yet"),
+                Err(e) => format!("the TRON node did not answer: {e}"),
+            };
+            sp.error(problem);
+            if !cliclack::confirm("Check again? (fix the permission first)")
+                .initial_value(true)
+                .interact()?
+            {
+                anyhow::bail!("the delegation-only permission is not set up");
+            }
+        }
+    }
+
     fn link_wallet(
         rt: &Runtime,
         platform: &Platform,
-        key: &SigningKey,
+        key: Option<&SigningKey>,
         address: &TronAddress,
     ) -> anyhow::Result<()> {
         let sp = cliclack::spinner();
@@ -493,6 +614,18 @@ mod wizard {
             return Ok(());
         }
         sp.stop("This wallet is not verified for the shop yet");
+        let Some(key) = key else {
+            // Only the wallet's own key proves ownership; a permission key cannot.
+            if existing.is_none() {
+                if let Err(e) = rt.block_on(platform.add_wallet(address.as_str())) {
+                    return scope_hint(&e.to_string(), e.status);
+                }
+            }
+            cliclack::log::warning(
+                "Verify the wallet in the cabinet (Shop → Wallets) by signing with TronLink. No jobs reach it until then.",
+            )?;
+            return Ok(());
+        };
         if !cliclack::confirm(
             "Verify it now? gtron-node signs a verification message with it. No funds move.",
         )
@@ -517,11 +650,10 @@ mod wizard {
         };
         // Sign only what verification looks like, for this very address: never whatever
         // text the server (or someone in between) sends.
-        if !message.starts_with(VERIFY_PREFIX)
-            || !message.contains(&format!("\nAddress: {}\n", address.as_str()))
-        {
+        if !is_verification_message(&message, address.as_str()) {
             anyhow::bail!(
-                "the platform asked to sign an unexpected message; not signing it:\n{message}"
+                "the platform asked to sign an unexpected message; not signing it:\n{}",
+                printable(&message)
             );
         }
         cliclack::note("Signing", &message)?;

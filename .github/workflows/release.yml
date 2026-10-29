@@ -4,6 +4,11 @@ name: release
 # musl, x86_64 and arm64) and macOS, SHA256SUMS, install.sh, and the image
 # ghcr.io/gtron-enegry/gtron-node. The release is built as a draft and published only once
 # every file is up, so `releases/latest` never points at a half-uploaded one.
+#
+# Only the upload steps hold a token that can write: tests and builds run third-party
+# build scripts, so they get a read-only token and no cache from earlier runs. Every file
+# carries a GitHub build provenance attestation (`gh attestation verify FILE -R
+# Gtron-Enegry/gtron-node`), so a file swapped on the release page does not verify.
 on:
   push:
     tags: ["v*"]
@@ -18,7 +23,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  GH_TOKEN: ${{ github.token }}
   TAG: ${{ github.ref_name }}
 
 jobs:
@@ -33,6 +37,8 @@ jobs:
           v="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)"/\1/')"
           test "$TAG" = "v$v" || { echo "tag $TAG, workspace version $v"; exit 1; }
       - name: Create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$TAG" --draft --verify-tag --title "gtron-node ${TAG#v}" \
             --notes "Install or upgrade: \`curl -fsSL https://gtron.network/install-node.sh | sh\`. Docker: \`ghcr.io/gtron-enegry/gtron-node:${TAG#v}\`. Check archives against SHA256SUMS."
@@ -42,7 +48,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: true
       matrix:
@@ -53,12 +59,11 @@ jobs:
           - { target: x86_64-apple-darwin, os: macos-latest, zig: false }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
       - name: Install cargo-zigbuild
         if: matrix.zig
         uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
@@ -70,7 +75,8 @@ jobs:
         # runner's externally-managed system Python.
         run: |
           python3 -m venv "$RUNNER_TEMP/zig"
-          "$RUNNER_TEMP/zig/bin/pip" install ziglang==0.13.0
+          echo "ziglang==0.13.0 --hash=sha256:3ce0c9f16547e5d61b32e0d226926e9a2552ef4b91fccf7ab5ea1a623a77824b" > "$RUNNER_TEMP/zig.txt"
+          "$RUNNER_TEMP/zig/bin/pip" install --require-hashes --only-binary :all: -r "$RUNNER_TEMP/zig.txt"
           echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
       - name: Test
         # Once per OS, on the host: the cross builds compile the same code.
@@ -91,7 +97,12 @@ jobs:
           cp "target/${{ matrix.target }}/release/gtron-node" README.md LICENSE "$name/"
           cp crates/node/dist/gtron-node.service crates/node/dist/node.env.example "$name/"
           tar -czf "$name.tar.gz" "$name"
-      - run: gh release upload "$TAG" gtron-node-*.tar.gz --clobber
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gtron-node-${{ matrix.target }}
+          path: gtron-node-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 3
 
   publish:
     needs: build
@@ -99,17 +110,37 @@ jobs:
     permissions:
       contents: write
       packages: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gtron-node-*
+          merge-multiple: true
+          path: out
       - name: Checksums and installer
         run: |
-          mkdir out && cd out
-          gh release download "$TAG" --pattern 'gtron-node-*.tar.gz'
-          cp ../install.sh .
+          cp install.sh out/
+          cd out
+          test "$(ls gtron-node-*.tar.gz | wc -l)" -eq 4
           sha256sum gtron-node-*.tar.gz install.sh | tee SHA256SUMS
-          gh release upload "$TAG" SHA256SUMS install.sh --clobber
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/gtron-node-*.tar.gz
+            out/install.sh
+            out/SHA256SUMS
+      - name: Upload
+        # No --clobber: the draft is new, so a file already there means something is wrong.
+        run: gh release upload "$TAG" out/gtron-node-*.tar.gz out/install.sh out/SHA256SUMS
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Image
+        id: image
         run: |
           mkdir -p image/bin/amd64 image/bin/arm64
           tar -xzf out/gtron-node-x86_64-unknown-linux-musl.tar.gz -C "$RUNNER_TEMP"
@@ -123,6 +154,13 @@ jobs:
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.licenses=Apache-2.0" \
             --label "org.opencontainers.image.version=${TAG#v}" \
-            -t "$image:${TAG#v}" -t "$image:latest" --push
+            -t "$image:${TAG#v}" -t "$image:latest" --push --metadata-file meta.json
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - name: Publish the release
         run: gh release edit "$TAG" --draft=false --latest

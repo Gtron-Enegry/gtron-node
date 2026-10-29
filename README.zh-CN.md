@@ -42,31 +42,73 @@ curl -fsSL https://gtron.network/install-node.sh | sh -s -- --dir ~/bin       # 
 
 </details>
 
-## 准备工作
+## 连接钱包：分步指南
 
-| | |
-|---|---|
-| **gtron.network 上的店铺**，处于 *agent* 模式，并有一个带 `jobs` 权限的提供方 API 密钥（`pk_live_…`）。控制台 → 店铺 → API 密钥。 | 🏪 |
-| **TRON 钱包**，已质押 TRX：需要其十六进制私钥（TronLink 导出的格式）。 | 👛 |
-| **一台持续开机的机器：** Linux（任意发行版，x86_64 或 arm64）或 macOS（Apple Silicon 或 Intel）。一台小型 VPS 就足够。 | 🖥️ |
-| **只需出站 HTTPS。** 不需要开放端口、公网 IP 或域名。 | 🔒 |
+大约需要 15 分钟，以及一台持续开机的机器：Linux（任意发行版，x86_64 或 arm64）或 macOS。一台小型 VPS 就足够；只需出站 HTTPS，不需要开放端口或域名。
 
-## 设置向导
+### 1. 已质押 TRX 的 TRON 钱包
 
-`gtron-node setup` 会问几个问题，其余的自动完成。随时可以再次运行以修改设置。
+gtron-node 出租的是您质押的 TRX 产生的**能量**；TRX 本身不会离开钱包。在 TronLink 中将 TRX 质押为 **Energy**（Stake 2.0）。
 
-| 步骤 | 询问内容 | 提示 |
-|:---:|---|---|
-| 1 | **Platform API** | 直接回车即为 `https://api.gtron.network`。 |
-| 2 | **店铺 API 密钥** | 立即向平台验证。输入不会显示。 |
-| 3 | **钱包私钥** | 输入不会显示，保存在只有代理能读取的文件中。向导会显示钱包地址供您确认。 |
-| 4 | **绑定钱包** | 将钱包添加到店铺，并通过签署平台的验证消息证明您拥有它。 |
-| 5 | **TRON 节点** | TronGrid（推荐；免费的 API 密钥可提高请求限额）或您自己的全节点。 |
-| 6 | **接收方** | 任何在您店铺租用的人，或仅限白名单中的地址。 |
-| 7 | **安全限额** | 使用推荐值或自定义。见 [安全限额](#安全限额)。 |
-| 8 | **运行方式** | 系统服务（systemd）、Docker、macOS 后台服务（launchd）或手动运行。只列出您的机器支持的选项。 |
+> [!TIP]
+> 请为此使用单独的钱包，不要用存放主要资产的钱包。
 
-最后，向导会显示设置、状态和日志的位置，以及管理服务的命令。
+### 2. “自有软件”模式的店铺
+
+登录 [gtron.network](https://gtron.network)，打开 **店铺 → 更改模式**，选择 **自有软件**。
+
+### 3. 店铺的供应商密钥
+
+在同一窗口点击 **创建密钥**（或 **店铺 → 设置 → 供应商密钥**，用途选 **代理**）。密钥形如 `pk_live_…`，只显示**一次**：请先复制保存，接下来几分钟要用。
+
+### 4. 将钱包添加到店铺
+
+**店铺 → 设置 → 钱包 → 添加钱包**：粘贴钱包地址，并在 TronLink 中签署消息。签名只证明钱包属于您，不会转移任何资产。钱包状态会变为 **已验证**。
+
+### 5. 选择代理签名用的密钥
+
+| | 仅限委托的密钥（推荐） | 钱包自身的私钥 |
+|---|---|---|
+| 如果机器被入侵 | 该密钥只能委托能量，**无法转走 TRX** | 攻击者将控制整个钱包 |
+| 您需要做的 | 向导自动生成密钥；在 TronLink 或 tronscan 上为它授予权限（[方法](#保护钱包仅限委托的密钥)） | 从 TronLink 导出私钥（钱包菜单 → *Export private key*） |
+| 费用 | TRON 网络修改权限的手续费（约 100 TRX） | 无 |
+
+### 6. 安装并回答向导
+
+```sh
+curl -fsSL https://gtron.network/install-node.sh | sh
+```
+
+| 向导询问 | 您输入 | 来源 |
+|---|---|---|
+| Platform API | 直接回车 | |
+| Shop API key | `pk_live_…` | 第 3 步 |
+| Signing key | *A delegation-only key* 或 *The wallet's own key* | 第 5 步 |
+| Wallet address · Permission id | 第 1 步的钱包 · `2`（或 tronscan 显示的编号） | 仅用于仅限委托的密钥 |
+| The key itself | *Create a new key here*，或粘贴十六进制私钥 | 第 5 步 |
+| TRON node | *TronGrid* 及其免费 API 密钥 | [trongrid.io](https://www.trongrid.io) → 注册 → Create API key |
+| Who may receive delegations? | *Any client* | 平台会为每笔租赁指定买家 |
+| Safety limits | *Recommended* 或自定义 | [含义](#安全限额) |
+| How should gtron-node run? | 第一个选项 | systemd、Docker、launchd 或手动 |
+
+输入的密钥不会显示。向导会逐项检查：密钥向平台验证，钱包余额和权限通过 TRON 节点验证。最后会显示设置和日志的位置。几秒钟内，控制台的 **更改模式** 窗口就会显示代理已连接。
+
+## 保护钱包：仅限委托的密钥
+
+TRON 允许钱包授予第二个密钥有限的**权限**（permission）。给代理一个只能*委托*和*收回*资源的密钥：即使有人控制了这台机器，这个密钥也转不走一个 TRX。您自己的私钥留在 TronLink 中。
+
+1. 在 `gtron-node setup` 中选择 **A delegation-only key → Create a new key here**。向导会显示新密钥的地址。
+2. 在 TronLink 或 [tronscan.org](https://tronscan.org)（Account → Permissions）为钱包添加 **active permission**：该地址权重 1、阈值 1，且只允许 **Delegate resource** 和 **Reclaim resource** 两种操作。修改权限需要支付 TRON 网络手续费。
+3. 回到向导：它会在链上检查权限，配置正确之前不会安装任何内容。
+
+代理每次启动都会再次检查，如果权限允许其他操作就拒绝运行。`gtron-node --check` 会显示正在使用哪种密钥。
+
+## 安全建议
+
+- **使用单独的钱包**出租能量，不要用存放主要资产的钱包。
+- **从小额开始**，确认运行正常后再提高限额。
+- 如果只服务已知客户，**优先使用接收方白名单**。
+- **只通过代理从这个钱包委托。** 在代理之外进行的委托不计入其限额。
 
 ## 工作原理
 
@@ -91,9 +133,9 @@ sequenceDiagram
 
 | | |
 |---|---|
-| 🔑 **私钥留在您手中** | 从仅所有者可读的文件中读取，只用于签名，从不发送到任何地方。特意没有用于传入私钥的命令行参数。 |
+| 🔑 **私钥留在您手中** | 从仅所有者可读的文件中读取，只用于签名，从不发送到任何地方。特意没有用于传入私钥的命令行参数。[仅限委托的密钥](#保护钱包仅限委托的密钥)即使被盗也无法转走 TRX。 |
 | 🧾 **只签署任务本身** | TRON 节点构建的交易会被解析，并逐字段与任务比对：类型、钱包、接收方、资源、数量、锁定。任何不符都会被拒绝。 |
-| 🛡️ **您的限额，而不是我们的** | 单次委托、24 小时内、锁定总额三项限额以及接收方白名单都在您的机器上检查。即使平台账户被攻破也无法绕过。 |
+| 🛡️ **您的限额，而不是我们的** | 单次委托、24 小时内、锁定总额三项限额以及接收方白名单都在您的机器上检查。即使平台账户被攻破也无法绕过。锁定按 TRON 的实际方式计算：对同一接收方的新锁定会延长之前的锁定。 |
 | 1️⃣ **每个任务只签一次** | 签名后的交易在广播前写入磁盘。崩溃或重启后会重新发送同一笔交易，绝不会签第二笔。 |
 | 🌊 **故障时保持冷静** | 平台或 TRON 节点不可用时，代理会从 2 秒到 1 分钟逐步退避，TronGrid 不会封禁您的 API 密钥。 |
 | ⏹️ **平稳停止** | `SIGTERM` 或 Ctrl+C：先完成手头的任务。再按一次 Ctrl+C 立即退出，这同样安全。 |
@@ -164,12 +206,13 @@ curl -fsSL https://gtron.network/install-node.sh | sh
 | 变量 | 含义 |
 |---|---|
 | `NODE_API_URL`、`NODE_API_KEY` | 平台地址和店铺的提供方密钥（`jobs` 权限） |
-| `NODE_PRIVATE_KEY_FILE` | 钱包私钥文件：十六进制，属于运行代理的用户，权限 `0400` |
+| `NODE_PRIVATE_KEY_FILE` | 签名密钥文件：十六进制，属于运行代理的用户，权限 `0400` |
+| `NODE_WALLET_ADDRESS`、`NODE_PERMISSION_ID` | 使用仅限委托的密钥时：它代表签名的钱包和权限编号 |
 | `TRONGRID_URL`、`TRONGRID_API_KEY` | 您的 TRON 节点，或带 API 密钥的 TronGrid |
 | `NODE_ALLOW_ANY_RECEIVER=1` 或 `NODE_ALLOWED_RECEIVERS=T…,T…` | 允许谁接收委托，二者必选其一 |
 | `NODE_MAX_*` | [安全限额](#安全限额) |
 | `NODE_LOCK_DELEGATIONS` | 在租期内锁定委托（默认 `true`）；平台只计入已锁定的委托 |
-| `NODE_STATE_DIR` | 状态目录（默认 `.gtron-node`） |
+| `NODE_STATE_DIR` | 状态目录（默认 `~/.gtron-node/state`） |
 | `RUST_LOG` | `error`、`warn`、`info` 或 `debug` |
 
 如果私钥文件或设置文件可被其他用户读取，代理会拒绝读取。
@@ -230,7 +273,11 @@ docker compose down
 sha256sum -c SHA256SUMS --ignore-missing      # macOS：shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-发布由 [GitHub Actions](.github/workflows/release.yml) 根据本仓库带标签的源码构建。
+发布由 [GitHub Actions](.github/workflows/release.yml) 根据本仓库带标签的源码构建，每个文件和 Docker 镜像都带有构建来源证明（attestation）。安装了 [GitHub CLI](https://cli.github.com) 时安装程序也会校验它；手动校验：
+
+```sh
+gh attestation verify gtron-node-x86_64-unknown-linux-musl.tar.gz -R Gtron-Enegry/gtron-node
+```
 
 ## 从源码构建
 

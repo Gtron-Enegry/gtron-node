@@ -704,6 +704,7 @@ dependencies = [
  "sha3",
  "thiserror",
  "url",
+ "zeroize",
 ]
 
 [[package]]

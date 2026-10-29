@@ -6,6 +6,10 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
+use gtron_tron_signing::tron::{read_body, MAX_BODY};
+
+use crate::printable::printable;
+
 #[derive(Debug, Deserialize)]
 pub struct Shop {
     pub name: String,
@@ -52,6 +56,7 @@ impl Platform {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(20))
                 .user_agent(concat!("gtron-node/", env!("CARGO_PKG_VERSION"), " setup"))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             url: url.trim_end_matches('/').to_owned(),
             key: key.to_owned(),
@@ -76,12 +81,15 @@ impl Platform {
             message: format!("cannot reach {}: {}", self.url, root_cause(&e)),
         })?;
         let status = res.status();
-        let text = res.text().await.unwrap_or_default();
+        let text = read_body(res, MAX_BODY).await.map_err(|e| Failure {
+            status: Some(status.as_u16()),
+            message: format!("unexpected answer from {}: {e}", self.url),
+        })?;
         if !status.is_success() {
             // The API's error envelope: {"error": {"message": "..."}}.
             let message = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+                .and_then(|v| v["error"]["message"].as_str().map(printable))
                 .unwrap_or_else(|| format!("HTTP {status}"));
             return Err(Failure {
                 status: Some(status.as_u16()),
@@ -94,8 +102,15 @@ impl Platform {
         })
     }
 
+    /// Its text fields are printed, so they come back without terminal escapes.
     pub async fn shop(&self) -> Result<Shop, Failure> {
-        self.call(reqwest::Method::GET, "/p1/shop", None).await
+        let s: Shop = self.call(reqwest::Method::GET, "/p1/shop", None).await?;
+        Ok(Shop {
+            name: printable(&s.name),
+            mode: printable(&s.mode),
+            status: printable(&s.status),
+            eligibility_issue: s.eligibility_issue.as_deref().map(printable),
+        })
     }
 
     pub async fn wallets(&self) -> Result<Vec<Wallet>, Failure> {
@@ -131,4 +146,56 @@ fn root_cause(e: &reqwest::Error) -> String {
         err = next;
     }
     err.to_string()
+}
+
+/// Whether `message` is exactly the platform's ownership proof for `address`
+/// (gtron_app::marketplace::verification_message), and nothing else to sign.
+pub fn is_verification_message(message: &str, address: &str) -> bool {
+    let lines: Vec<&str> = message.split('\n').collect();
+    let [title, shop, addr, code, outro] = lines[..] else {
+        return false;
+    };
+    title == "gtron.network address verification"
+        && shop.strip_prefix("Shop: ").is_some_and(|s| !s.is_empty())
+        && addr == format!("Address: {address}")
+        && code.strip_prefix("Code: ").is_some_and(|c| {
+            !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        && outro == "Signing this message proves control of the wallet. It moves no funds."
+        && !message.chars().any(|c| c.is_control() && c != '\n')
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::is_verification_message;
+
+    const A: &str = "TEMkRxLtCCdL4BCwbPXbbNWe4a9gtJ7kq7";
+
+    fn msg(shop: &str, addr: &str, code: &str) -> String {
+        format!(
+            "gtron.network address verification\nShop: {shop}\nAddress: {addr}\nCode: {code}\nSigning this message proves control of the wallet. It moves no funds."
+        )
+    }
+
+    #[test]
+    fn only_the_exact_template_is_signed() {
+        assert!(is_verification_message(
+            &msg("Energy (prv_1)", A, "Ab12cd"),
+            A
+        ));
+        assert!(!is_verification_message(
+            &msg("Energy", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", "x1"),
+            A
+        ));
+        assert!(!is_verification_message(
+            &msg("Energy", A, "x1; transfer"),
+            A
+        ));
+        assert!(!is_verification_message(&msg("E\x1b[2K", A, "x1"), A));
+        assert!(!is_verification_message(
+            &format!("{}\nmore", msg("E", A, "x1")),
+            A
+        ));
+        assert!(!is_verification_message(&msg("E\nAddress: x", A, "x1"), A));
+    }
 }

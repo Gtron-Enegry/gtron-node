@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Parser};
 use gtron_tron_address::TronAddress;
-use gtron_tron_signing::secretfile::check_private_file;
+use gtron_tron_signing::secretfile::read_private_file;
 use zeroize::Zeroizing;
 
 use crate::limits::LocalLimits;
@@ -27,8 +27,10 @@ pub struct Cli {
     #[arg(long, env = "TRONGRID_API_KEY", hide_env_values = true)]
     pub trongrid_api_key: Option<String>,
     /// Where signed transactions and the spend log are kept. One agent per directory.
-    #[arg(long, env = "NODE_STATE_DIR", default_value = ".gtron-node")]
-    pub state_dir: PathBuf,
+    /// Default `~/.gtron-node/state`; a relative path is taken from the directory the agent
+    /// starts in, so the same agent started elsewhere would forget what it signed.
+    #[arg(long, env = "NODE_STATE_DIR")]
+    pub state_dir: Option<PathBuf>,
     /// Lock delegations for the rental period so the wallet cannot reclaim early by mistake.
     /// `true`/`false`, also `1`/`0`, `yes`/`no`, `on`/`off`.
     #[arg(
@@ -77,6 +79,15 @@ pub struct Cli {
         value_parser = BoolishValueParser::new()
     )]
     pub allow_any_receiver: bool,
+    /// The wallet whose stake is delegated, when the key is not that wallet's own key but a
+    /// key of one of its active permissions (`NODE_PERMISSION_ID`). Recommended: a
+    /// permission that may only delegate and reclaim resources, so the key on this machine
+    /// cannot move TRX even if it is stolen.
+    #[arg(long, env = "NODE_WALLET_ADDRESS")]
+    pub wallet: Option<String>,
+    /// Id of the wallet's active permission the key signs with (2 or more).
+    #[arg(long, env = "NODE_PERMISSION_ID")]
+    pub permission_id: Option<i32>,
     /// Print the wallet address and exit.
     #[arg(long)]
     pub address: bool,
@@ -90,6 +101,43 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// The state directory as an absolute path.
+    pub fn state_dir(&self) -> anyhow::Result<PathBuf> {
+        let dir = match &self.state_dir {
+            Some(d) => d.clone(),
+            None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+                anyhow::anyhow!("set NODE_STATE_DIR (HOME is not set for the default)")
+            })?)
+            .join(".gtron-node/state"),
+        };
+        Ok(std::path::absolute(dir)?)
+    }
+
+    /// The wallet the agent delegates from, and the permission it signs under (None = the
+    /// wallet's own key).
+    pub fn wallet(&self, signer: &TronAddress) -> anyhow::Result<(TronAddress, Option<i32>)> {
+        let wallet = match &self.wallet {
+            Some(w) => w
+                .trim()
+                .parse::<TronAddress>()
+                .map_err(|e| anyhow::anyhow!("NODE_WALLET_ADDRESS: {e}"))?,
+            None => signer.clone(),
+        };
+        match (wallet == *signer, self.permission_id) {
+            (true, None) => Ok((wallet, None)),
+            (true, Some(_)) => anyhow::bail!(
+                "NODE_PERMISSION_ID is for a key that is not the wallet's own: set NODE_WALLET_ADDRESS to the wallet"
+            ),
+            (false, None) => anyhow::bail!(
+                "the key belongs to {signer}, not to {wallet}: set NODE_PERMISSION_ID to the wallet's permission for this key"
+            ),
+            (false, Some(id)) if id < 2 => {
+                anyhow::bail!("NODE_PERMISSION_ID must be an active permission (2 or more)")
+            }
+            (false, Some(id)) => Ok((wallet, Some(id))),
+        }
+    }
+
     pub fn limits(&self) -> anyhow::Result<LocalLimits> {
         let allowed_receivers = self
             .allowed_receivers
@@ -134,8 +182,8 @@ pub fn private_key() -> anyhow::Result<Zeroizing<String>> {
         .filter(|p| !p.is_empty())
     {
         Some(path) => {
-            check_private_file(&path).map_err(|e| anyhow::anyhow!("NODE_PRIVATE_KEY_FILE: {e}"))?;
-            let raw = Zeroizing::new(std::fs::read_to_string(&path)?);
+            let raw = read_private_file(&path)
+                .map_err(|e| anyhow::anyhow!("NODE_PRIVATE_KEY_FILE: {e}"))?;
             Zeroizing::new(raw.trim().to_owned())
         }
         None => Zeroizing::new(std::env::var("NODE_PRIVATE_KEY").map_err(|_| {
@@ -169,8 +217,8 @@ pub fn load_config() -> Result<(), String> {
     let Some(path) = config_path() else {
         return Ok(());
     };
-    check_private_file(&path).map_err(|e| format!("--config: {e}"))?;
-    dotenvy::from_path(&path).map_err(|e| format!("--config {}: {e}", path.display()))
+    let text = read_private_file(&path).map_err(|e| format!("--config: {e}"))?;
+    dotenvy::from_read(text.as_bytes()).map_err(|e| format!("--config {}: {e}", path.display()))
 }
 
 /// Load `./.env` only if nobody else could have written or read it. Returns a warning to
@@ -179,8 +227,8 @@ pub fn load_dotenv(path: &Path) -> Option<String> {
     if std::fs::symlink_metadata(path).is_err() {
         return None;
     }
-    match check_private_file(path) {
-        Ok(()) => dotenvy::from_path(path)
+    match read_private_file(path) {
+        Ok(text) => dotenvy::from_read(text.as_bytes())
             .err()
             .map(|e| format!("{}: {e}", path.display())),
         Err(e) => Some(format!("not loading {e}")),

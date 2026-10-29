@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,8 +59,14 @@ impl Host {
             systemd: cfg!(target_os = "linux") && Path::new("/run/systemd/system").is_dir(),
             docker,
             macos: cfg!(target_os = "macos"),
-            home: std::env::var_os("HOME").map(PathBuf::from),
+            home: home_dir(),
         }
+    }
+
+    /// A per-user background service makes no sense as root (and `sudo` on macOS keeps the
+    /// invoking user's HOME, a directory that user could have rigged with symlinks).
+    pub fn launchd_ok(&self) -> bool {
+        self.macos && !self.root
     }
 
     /// `~/.gtron-node`: settings, key and state for launchd and manual runs.
@@ -100,6 +107,8 @@ pub struct Settings {
     pub max_daily_trx: u64,
     pub max_locked_trx: u64,
     pub max_lock_days: u64,
+    /// The wallet and its active permission, when the key is a delegation-only key.
+    pub permission: Option<(TronAddress, i32)>,
 }
 
 const SUN_PER_TRX: u64 = 1_000_000;
@@ -114,6 +123,10 @@ impl Settings {
         };
         line("NODE_API_URL", &self.api_url);
         line("NODE_API_KEY", &self.api_key);
+        if let Some((wallet, id)) = &self.permission {
+            line("NODE_WALLET_ADDRESS", wallet.as_str());
+            line("NODE_PERMISSION_ID", &id.to_string());
+        }
         line("TRONGRID_URL", &self.trongrid_url);
         if let Some(k) = &self.trongrid_api_key {
             line("TRONGRID_API_KEY", k);
@@ -176,6 +189,46 @@ pub fn tilde(path: &Path, home: Option<&Path>) -> String {
 
 /// Write `contents` to `path` with `mode`, owned by `owner`, without a moment where the
 /// file exists with wider permissions or half its contents.
+/// The home directory of the user this process runs as: from the password database when
+/// root (`sudo` may keep another user's HOME), else HOME.
+fn home_dir() -> Option<PathBuf> {
+    let euid = gtron_tron_signing::secretfile::effective_uid();
+    if euid != 0 {
+        return std::env::var_os("HOME").map(PathBuf::from);
+    }
+    // SAFETY: setup is single-threaded here; the entry is copied out before any other call.
+    unsafe {
+        let pw = libc::getpwuid(euid);
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir);
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+    }
+}
+
+/// `path` is a real directory (not a symlink) owned by this process's user, or by `owner`.
+fn own_dir(path: &Path, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    if !meta.file_type().is_dir() {
+        anyhow::bail!(
+            "{} is not a directory (a symlink?); not writing there",
+            path.display()
+        );
+    }
+    let euid = gtron_tron_signing::secretfile::effective_uid();
+    if meta.uid() != euid && owner.is_none_or(|(uid, _)| meta.uid() != uid) {
+        anyhow::bail!(
+            "{} belongs to uid {}; not writing there",
+            path.display(),
+            meta.uid()
+        );
+    }
+    Ok(())
+}
+
 fn write_private(
     path: &Path,
     contents: &[u8],
@@ -192,18 +245,20 @@ fn write_private(
         .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
     f.write_all(contents)?;
     f.sync_all()?;
-    drop(f);
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+    // On the open file, not by path: nothing can be swapped in between.
+    f.set_permissions(fs::Permissions::from_mode(mode))?;
     if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(&tmp, Some(uid), Some(gid))
+        std::os::unix::fs::fchown(&f, Some(uid), Some(gid))
             .map_err(|e| anyhow::anyhow!("chown {}: {e}", tmp.display()))?;
     }
+    drop(f);
     fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     Ok(())
 }
 
 fn private_dir(path: &Path, mode: u32, owner: Option<(u32, u32)>) -> anyhow::Result<()> {
     fs::create_dir_all(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    own_dir(path, owner)?;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(path, Some(uid), Some(gid))?;
@@ -524,7 +579,12 @@ fn launchd(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?
         .join("Library/LaunchAgents");
+    anyhow::ensure!(
+        !host.root,
+        "the background service is per user: run setup without sudo"
+    );
     fs::create_dir_all(&agents)?;
+    own_dir(&agents, None)?;
     let plist = agents.join(format!("{LAUNCHD_LABEL}.plist"));
     step("Installing the service");
     write_private(
@@ -600,6 +660,7 @@ mod tests {
             max_daily_trx: 200_000,
             max_locked_trx: 500_000,
             max_lock_days: 30,
+            permission: None,
         }
     }
 

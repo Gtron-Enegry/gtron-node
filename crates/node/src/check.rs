@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, KeyScope};
 
 #[derive(Deserialize)]
 struct Shop {
@@ -12,6 +12,8 @@ struct Shop {
     eligibility_issue: Option<String>,
 }
 
+use crate::printable::printable;
+
 #[derive(Default)]
 struct Report {
     failed: bool,
@@ -19,15 +21,15 @@ struct Report {
 
 impl Report {
     fn ok(&mut self, what: &str, detail: impl std::fmt::Display) {
-        println!("ok    {what:<10} {detail}");
+        println!("ok    {what:<10} {}", printable(&detail.to_string()));
     }
 
     fn warn(&mut self, what: &str, detail: impl std::fmt::Display) {
-        println!("warn  {what:<10} {detail}");
+        println!("warn  {what:<10} {}", printable(&detail.to_string()));
     }
 
     fn fail(&mut self, what: &str, detail: impl std::fmt::Display) {
-        println!("FAIL  {what:<10} {detail}");
+        println!("FAIL  {what:<10} {}", printable(&detail.to_string()));
         self.failed = true;
     }
 }
@@ -37,6 +39,18 @@ pub async fn run(agent: &Agent, state: Option<&str>) -> bool {
     let mut r = Report::default();
     r.ok("version", env!("CARGO_PKG_VERSION"));
     r.ok("wallet", &agent.address);
+    match agent.key_scope().await {
+        Ok(KeyScope::Owner) => r.warn(
+            "key",
+            "the wallet's own key: it can move all TRX if this machine is compromised",
+        ),
+        Ok(KeyScope::DelegationOnly(id)) => r.ok(
+            "key",
+            format!("permission {id}: may only delegate and reclaim resources"),
+        ),
+        Err(Ok(refused)) => r.fail("key", refused),
+        Err(Err(e)) => r.fail("key", format!("cannot read the wallet's permissions: {e}")),
+    }
     match state {
         None => r.ok("state", "writable, locked by this check"),
         Some(note) => r.warn("state", note),

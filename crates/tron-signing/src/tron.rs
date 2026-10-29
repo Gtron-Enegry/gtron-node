@@ -108,11 +108,105 @@ pub fn signed_transaction_bytes(raw: &[u8], signature: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `DelegateResourceContract` and `UnDelegateResourceContract` in Tron.proto's ContractType.
+pub const DELEGATE_RESOURCE_CONTRACT: usize = 57;
+pub const UNDELEGATE_RESOURCE_CONTRACT: usize = 58;
+
+/// An active permission of an account: who may sign which contract types for it.
+#[derive(Debug, Clone)]
+pub struct Permission {
+    pub threshold: i64,
+    /// (base58 address, weight)
+    pub keys: Vec<(String, i64)>,
+    /// Bit `n` (byte n/8, bit n%8) set = contract type `n` allowed.
+    pub operations: Vec<u8>,
+}
+
+impl Permission {
+    pub fn allowed_types(&self) -> Vec<usize> {
+        (0..self.operations.len() * 8)
+            .filter(|n| self.operations[n / 8] & (1 << (n % 8)) != 0)
+            .collect()
+    }
+
+    /// `Ok` when `signer` alone can use this permission and it allows delegating and
+    /// reclaiming resources and nothing else: a stolen key then cannot move TRX.
+    pub fn check_delegation_only(&self, signer: &TronAddress) -> Result<(), String> {
+        let weight = self
+            .keys
+            .iter()
+            .find(|(a, _)| a == signer.as_str())
+            .map(|(_, w)| *w)
+            .ok_or_else(|| format!("{signer} is not a key of this permission"))?;
+        if weight < self.threshold {
+            return Err(format!(
+                "{signer} has weight {weight}, the permission needs {}",
+                self.threshold
+            ));
+        }
+        let types = self.allowed_types();
+        let wanted = [DELEGATE_RESOURCE_CONTRACT, UNDELEGATE_RESOURCE_CONTRACT];
+        if !wanted.iter().all(|t| types.contains(t)) {
+            return Err("the permission must allow DelegateResource and UnDelegateResource".into());
+        }
+        let extra: Vec<String> = types
+            .iter()
+            .filter(|t| !wanted.contains(t))
+            .map(|&t| contract_name(t).map_or_else(|| format!("type {t}"), str::to_owned))
+            .collect();
+        if !extra.is_empty() {
+            return Err(format!(
+                "the permission also allows contract types {}: a stolen key could do that too; allow only DelegateResource and UnDelegateResource",
+                extra.join(", ")
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Tron.proto names of the contract types a permission most often allows by mistake.
+fn contract_name(t: usize) -> Option<&'static str> {
+    Some(match t {
+        1 => "TransferContract (sends TRX)",
+        2 => "TransferAssetContract",
+        4 => "VoteWitnessContract",
+        30 => "CreateSmartContract",
+        31 => "TriggerSmartContract (sends USDT and other tokens)",
+        46 => "AccountPermissionUpdateContract (changes the wallet's keys)",
+        54 => "FreezeBalanceV2Contract",
+        55 => "UnfreezeBalanceV2Contract",
+        56 => "WithdrawExpireUnfreezeContract",
+        59 => "CancelAllUnfreezeV2Contract",
+        _ => return None,
+    })
+}
+
+/// Largest response body read from a TRON node or the platform. Real answers are a few KB;
+/// a peer streaming more would otherwise grow memory until the process dies.
+pub const MAX_BODY: usize = 1 << 20;
+
+/// The body of `res` as text, refusing anything over `limit` bytes.
+pub async fn read_body(mut res: reqwest::Response, limit: usize) -> Result<String, String> {
+    if res.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(format!("response over {limit} bytes"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > limit {
+            return Err(format!("response over {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| "response is not UTF-8".to_owned())
+}
+
 impl Node {
     pub fn new(base_url: &str, api_key: Option<String>, timeout: Duration) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(timeout)
+                // A redirect would carry TRON-PRO-API-KEY to wherever it points.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             base_url: base_url.trim_end_matches('/').to_owned(),
@@ -137,10 +231,7 @@ impl Node {
             .await
             .map_err(|e| NodeError::Http(e.to_string()))?;
         let status = res.status();
-        let text = res
-            .text()
-            .await
-            .map_err(|e| NodeError::Http(e.to_string()))?;
+        let text = read_body(res, MAX_BODY).await.map_err(NodeError::Http)?;
         if !status.is_success() {
             return Err(NodeError::Refused(format!(
                 "HTTP {status}: {}",
@@ -330,6 +421,53 @@ impl Node {
         }
     }
 
+    /// The account's active permission `id`, if it has one.
+    pub async fn active_permission(
+        &self,
+        owner: &TronAddress,
+        id: i32,
+    ) -> Result<Option<Permission>, NodeError> {
+        let v = self
+            .post(
+                "wallet/getaccount",
+                serde_json::json!({ "address": owner.as_str(), "visible": true }),
+            )
+            .await?;
+        let Some(list) = v.get("active_permission").and_then(|a| a.as_array()) else {
+            return Ok(None);
+        };
+        let Some(p) = list
+            .iter()
+            .find(|p| p.get("id").and_then(|i| i.as_i64()).unwrap_or(0) == i64::from(id))
+        else {
+            return Ok(None);
+        };
+        let operations = p
+            .get("operations")
+            .and_then(|o| o.as_str())
+            .and_then(|o| hex::decode(o).ok())
+            .unwrap_or_default();
+        let keys = p
+            .get("keys")
+            .and_then(|k| k.as_array())
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|k| {
+                        Some((
+                            k.get("address")?.as_str()?.to_owned(),
+                            k.get("weight")?.as_i64()?,
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(Permission {
+            threshold: p.get("threshold").and_then(|t| t.as_i64()).unwrap_or(1),
+            keys,
+            operations,
+        }))
+    }
+
     /// TRX balance in SUN and TRC-20 balances (raw units) as `getaccount` reports them.
     pub async fn balances(
         &self,
@@ -435,5 +573,42 @@ mod tests {
             rest: Default::default(),
         };
         assert!(matches!(bad.verify_id(), Err(NodeError::TxIdMismatch)));
+    }
+
+    #[test]
+    fn delegation_only_permission() {
+        let signer: TronAddress = "TEMkRxLtCCdL4BCwbPXbbNWe4a9gtJ7kq7".parse().unwrap();
+        let mut ops = vec![0u8; 32];
+        ops[7] |= 1 << 1; // 57
+        ops[7] |= 1 << 2; // 58
+        let p = Permission {
+            threshold: 1,
+            keys: vec![(signer.to_string(), 1)],
+            operations: ops.clone(),
+        };
+        assert_eq!(p.allowed_types(), vec![57, 58]);
+        assert!(p.check_delegation_only(&signer).is_ok());
+        let other: TronAddress = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t".parse().unwrap();
+        assert!(p.check_delegation_only(&other).is_err());
+        let mut transfer = ops.clone();
+        transfer[0] |= 1 << 1; // 1 = TransferContract
+        let p2 = Permission {
+            operations: transfer,
+            ..p.clone()
+        };
+        assert!(p2
+            .check_delegation_only(&signer)
+            .unwrap_err()
+            .contains("TransferContract"));
+        let p3 = Permission {
+            threshold: 2,
+            ..p.clone()
+        };
+        assert!(p3.check_delegation_only(&signer).is_err());
+        let p4 = Permission {
+            operations: vec![0; 32],
+            ..p
+        };
+        assert!(p4.check_delegation_only(&signer).is_err());
     }
 }
