@@ -169,7 +169,7 @@ mod wizard {
                 "simplest · whoever gets this machine controls the wallet",
             )
             .interact()?;
-        let (hex_key, signing_key, address, permission_id) = if limited {
+        let (hex_key, signing_key, address) = if limited {
             let wallet: String = cliclack::input("Wallet address (the one holding the staked TRX)")
                 .placeholder("T…")
                 .validate(|s: &String| {
@@ -180,14 +180,6 @@ mod wizard {
                 })
                 .interact()?;
             let wallet: TronAddress = wallet.trim().parse()?;
-            let id: String = cliclack::input("Permission id")
-                .default_input("2")
-                .validate(|s: &String| match s.trim().parse::<i32>() {
-                    Ok(n) if n >= 2 => Ok(()),
-                    _ => Err("Active permissions are numbered from 2"),
-                })
-                .interact()?;
-            let id: i32 = id.trim().parse()?;
             let (hex_key, key) = if cliclack::select("The key itself")
                 .item(
                     true,
@@ -205,12 +197,12 @@ mod wizard {
             cliclack::note(
                 "Give this key the permission",
                 format!(
-                    "Key address  {}\n\nIn TronLink or on tronscan.org (Account → Permissions), give wallet\n{} an active permission with id {id} that:\n  · has this key address with weight 1, threshold 1\n  · allows only “Delegate resource” and “Reclaim resource”\n\nSetup checks it on chain before it installs anything.",
+                    "Key address  {}\n\nOn tronscan.org/#/wallet/permissions, signed in with wallet\n{}:\n  1. Owner Permission → Edit Permission → Add Active Permission\n  2. Operations → +Add: only “Delegate Resources” and “Reclaim Resources”\n  3. Threshold 1 · Authorized To: the key address above · Weight 1 → Add\n  4. Save, and confirm in TronLink (TRON charges a fee for it)\n\nSetup checks it on chain before it installs anything.",
                     style(signer.as_str()).bold(),
                     wallet
                 ),
             )?;
-            (hex_key, key, wallet, Some(id))
+            (hex_key, key, wallet)
         } else {
             loop {
                 let (hex_key, key) = ask_key()?;
@@ -222,19 +214,14 @@ mod wizard {
                 .initial_value(true)
                 .interact()?
                 {
-                    break (hex_key, key, address, None);
+                    break (hex_key, key, address);
                 }
             }
         };
-        link_wallet(
-            rt,
-            &platform,
-            permission_id.is_none().then_some(&signing_key),
-            &address,
-        )?;
+        link_wallet(rt, &platform, (!limited).then_some(&signing_key), &address)?;
 
         // ---- 3. TRON node -------------------------------------------------------------
-        let (trongrid_url, trongrid_api_key, allow_plain_http_node) = loop {
+        let (trongrid_url, trongrid_api_key, allow_plain_http_node, permission_id) = loop {
             let own = cliclack::select("TRON node")
                 .item(false, "TronGrid", "recommended · api.trongrid.io")
                 .item(true, "My own node", "full node HTTP API")
@@ -293,10 +280,17 @@ mod wizard {
                         "TRON node reachable · wallet holds {} TRX",
                         trx((sun / 1_000_000).max(0) as u64)
                     ));
-                    if let Some(id) = permission_id {
-                        check_permission(rt, &node, &address, id, &address_of(&signing_key))?;
-                    }
-                    break (url, key, plain);
+                    let permission_id = if limited {
+                        Some(find_permission(
+                            rt,
+                            &node,
+                            &address,
+                            &address_of(&signing_key),
+                        )?)
+                    } else {
+                        None
+                    };
+                    break (url, key, plain, permission_id);
                 }
                 Err(e) => {
                     sp.error(format!("{e}"));
@@ -556,32 +550,48 @@ mod wizard {
         }
     }
 
-    /// Wait until the wallet's permission `id` lets `signer` delegate and nothing more.
-    fn check_permission(
+    /// Wait until one of the wallet's active permissions lets `signer` delegate and nothing
+    /// more; its id.
+    fn find_permission(
         rt: &Runtime,
         node: &Node,
         wallet: &TronAddress,
-        id: i32,
         signer: &TronAddress,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<i32> {
         loop {
             let sp = cliclack::spinner();
-            sp.start("Checking the wallet's permission on chain…");
-            let problem = match rt.block_on(node.active_permission(wallet, id)) {
-                Ok(Some(p)) => match p.check_delegation_only(signer) {
-                    Ok(()) => {
-                        sp.stop(format!(
-                            "Permission {id}: this key may only delegate and reclaim resources"
-                        ));
-                        return Ok(());
+            sp.start("Looking for the key's permission on chain…");
+            let problem = match rt.block_on(node.active_permissions(wallet)) {
+                Ok(list) => {
+                    let mine: Vec<_> = list
+                        .iter()
+                        .filter(|(_, p)| p.keys.iter().any(|(a, _)| a == signer.as_str()))
+                        .collect();
+                    match mine
+                        .iter()
+                        .find(|(_, p)| p.check_delegation_only(signer).is_ok())
+                    {
+                        Some((id, _)) => {
+                            sp.stop(format!(
+                                "Permission {id}: this key may only delegate and reclaim resources"
+                            ));
+                            return Ok(*id);
+                        }
+                        None => match mine.first() {
+                            Some((id, p)) => format!(
+                                "permission {id}: {}",
+                                p.check_delegation_only(signer).unwrap_err()
+                            ),
+                            None => {
+                                format!("no active permission of {wallet} has key {signer} yet")
+                            }
+                        },
                     }
-                    Err(e) => e,
-                },
-                Ok(None) => format!("{wallet} has no active permission {id} yet"),
+                }
                 Err(e) => format!("the TRON node did not answer: {e}"),
             };
             sp.error(problem);
-            if !cliclack::confirm("Check again? (fix the permission first)")
+            if !cliclack::confirm("Check again? (add or fix the permission first)")
                 .initial_value(true)
                 .interact()?
             {

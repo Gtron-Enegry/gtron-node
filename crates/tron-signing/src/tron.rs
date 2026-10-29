@@ -427,6 +427,19 @@ impl Node {
         owner: &TronAddress,
         id: i32,
     ) -> Result<Option<Permission>, NodeError> {
+        Ok(self
+            .active_permissions(owner)
+            .await?
+            .into_iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, p)| p))
+    }
+
+    /// All active permissions of the account, with their ids.
+    pub async fn active_permissions(
+        &self,
+        owner: &TronAddress,
+    ) -> Result<Vec<(i32, Permission)>, NodeError> {
         let v = self
             .post(
                 "wallet/getaccount",
@@ -434,38 +447,41 @@ impl Node {
             )
             .await?;
         let Some(list) = v.get("active_permission").and_then(|a| a.as_array()) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let Some(p) = list
+        Ok(list
             .iter()
-            .find(|p| p.get("id").and_then(|i| i.as_i64()).unwrap_or(0) == i64::from(id))
-        else {
-            return Ok(None);
-        };
-        let operations = p
-            .get("operations")
-            .and_then(|o| o.as_str())
-            .and_then(|o| hex::decode(o).ok())
-            .unwrap_or_default();
-        let keys = p
-            .get("keys")
-            .and_then(|k| k.as_array())
-            .map(|keys| {
-                keys.iter()
-                    .filter_map(|k| {
-                        Some((
-                            k.get("address")?.as_str()?.to_owned(),
-                            k.get("weight")?.as_i64()?,
-                        ))
+            .filter_map(|p| {
+                let id = i32::try_from(p.get("id")?.as_i64()?).ok()?;
+                let operations = p
+                    .get("operations")
+                    .and_then(|o| o.as_str())
+                    .and_then(|o| hex::decode(o).ok())
+                    .unwrap_or_default();
+                let keys = p
+                    .get("keys")
+                    .and_then(|k| k.as_array())
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(|k| {
+                                Some((
+                                    k.get("address")?.as_str()?.to_owned(),
+                                    k.get("weight")?.as_i64()?,
+                                ))
+                            })
+                            .collect()
                     })
-                    .collect()
+                    .unwrap_or_default();
+                Some((
+                    id,
+                    Permission {
+                        threshold: p.get("threshold").and_then(|t| t.as_i64()).unwrap_or(1),
+                        keys,
+                        operations,
+                    },
+                ))
             })
-            .unwrap_or_default();
-        Ok(Some(Permission {
-            threshold: p.get("threshold").and_then(|t| t.as_i64()).unwrap_or(1),
-            keys,
-            operations,
-        }))
+            .collect())
     }
 
     /// TRX balance in SUN and TRC-20 balances (raw units) as `getaccount` reports them.
